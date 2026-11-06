@@ -22,7 +22,9 @@
 #include "wireguard_psk.h"
 
 extern "C" struct netif* __real_ip4_route_src(const ip4_addr_t* source, const ip4_addr_t* destination);
-// lwIP is precompiled, so wrap its source-route selector to apply AllowedIPs.
+// lwIP is precompiled, so wrap its source-route selector to apply WireGuard
+// AllowedIPs without changing the framework library. Prefer a matching live
+// non-WireGuard interface; otherwise select the most specific configured route.
 extern "C" struct netif* __wrap_ip4_route_src(const ip4_addr_t* source, const ip4_addr_t* destination) {
   for (struct netif* interface = netif_list; interface; interface = interface->next) {
     if (interface->name[0] == 'w' && interface->name[1] == 'g') continue;
@@ -43,7 +45,8 @@ static AsyncWebSocket ws0("/ws/0"), ws1("/ws/1");
 static U8G2_SSD1306_128X32_UNIVISION_F_SW_I2C oled(U8G2_R0, PIN_OLED_SCL, PIN_OLED_SDA, U8X8_PIN_NONE);
 static uint32_t restartAt = 0;
 
-// ===================================================================== helpers
+// ===================================================================== common helpers
+// Escape JSON string content before constructing small JSON responses by hand.
 static String jesc(const String& s) {
   String o; o.reserve(s.length() + 8);
   for (size_t i = 0; i < s.length(); i++) {
@@ -61,10 +64,14 @@ static String P(AsyncWebServerRequest* r, const char* k) {
   return p ? p->value() : String();
 }
 
-// ===================================================================== users
+// ===================================================================== users and password storage
+// User records are stored as a fixed-size NVS blob. Passwords are never stored
+// directly: each record contains a random salt and an iterated SHA-256 digest.
 struct User { char name[17]; uint8_t salt[16]; uint8_t hash[32]; uint8_t role; uint8_t used; uint8_t must; uint8_t pad; };
 static User users[MAX_USERS];
 
+// Derive a password digest with PW_ITER rounds. Rehashing the previous digest
+// makes a database dump more expensive to brute-force than a single SHA-256.
 static void hashPw(const char* pw, const uint8_t* salt, uint8_t* out) {
   uint8_t buf[32 + 16 + 64], h[32] = {0};
   size_t pl = strlen(pw); if (pl > 64) pl = 64;
@@ -78,6 +85,7 @@ static void hashPw(const char* pw, const uint8_t* salt, uint8_t* out) {
   }
   memcpy(out, h, 32);
 }
+// Compare all bytes even after finding a mismatch to avoid an early-exit timing leak.
 static bool ctEq(const uint8_t* a, const uint8_t* b, size_t n) { uint8_t d = 0; for (size_t i = 0; i < n; i++) d |= a[i] ^ b[i]; return d == 0; }
 static void setPw(User& u, const char* pw) { esp_fill_random(u.salt, 16); hashPw(pw, u.salt, u.hash); }
 static bool checkPw(const User& u, const char* pw) { uint8_t h[32]; hashPw(pw, u.salt, h); return ctEq(h, u.hash, 32); }
@@ -85,6 +93,8 @@ static void saveUsers() { prefs.putBytes("users", users, sizeof(users)); }
 static void loadUsers() {
   memset(users, 0, sizeof(users));
   if (prefs.getBytesLength("users") == sizeof(users)) { prefs.getBytes("users", users, sizeof(users)); return; }
+  // First boot (or missing user database): create a temporary admin that must
+  // change its password before any normal authenticated operation is allowed.
   strcpy(users[0].name, "admin"); users[0].role = R_ADMIN; users[0].used = 1; users[0].must = 1;
   setPw(users[0], "admin"); saveUsers();
 }
@@ -97,7 +107,8 @@ static bool validName(const String& n) {
   return true;
 }
 
-// ===================================================================== sessions
+// ===================================================================== sessions and authorization
+// Session tokens live in RAM only; rebooting the ESP32 invalidates all logins.
 struct Session { bool used; char tok[33]; int8_t user; uint32_t exp; };
 static Session sess[MAX_SESS];
 
@@ -128,7 +139,8 @@ static int newSession(int user, char* tokOut) {
 }
 static int sessionCount() { int n = 0; for (int i = 0; i < MAX_SESS; i++) if (sessValid(i)) n++; return n; }
 
-// auth: returns session index or -1 (reply already sent)
+// Enforce a minimum role and the first-login password change. On failure this
+// helper sends the HTTP response itself and returns -1 to stop the route.
 static int auth(AsyncWebServerRequest* r, int minRole, bool allowMust = false) {
   int si = findSession(r);
   if (si < 0) {
@@ -141,7 +153,8 @@ static int auth(AsyncWebServerRequest* r, int minRole, bool allowMust = false) {
   return si;
 }
 
-// login brute-force protection (per IP)
+// Keep a small fixed table of login failures; this avoids heap allocation on
+// each request while applying a temporary lockout per remote IP.
 struct Fail { uint32_t ip; uint8_t n; uint32_t until; };
 static Fail fails[8];
 static Fail* failFor(uint32_t ip) {
@@ -150,7 +163,9 @@ static Fail* failFor(uint32_t ip) {
   free_->ip = ip; free_->n = 0; free_->until = 0; return free_;
 }
 
-// ===================================================================== consoles
+// ===================================================================== UART terminals
+// Each Console owns one hardware UART, its WebSocket, a bounded line history,
+// a transmit-to-browser staging buffer, and a sequence-numbered RX ring buffer.
 struct WsCli { bool used; uint32_t id; char tok[33]; int8_t user; };
 struct Console {
   HardwareSerial* ser; AsyncWebSocket* ws;
@@ -163,6 +178,7 @@ struct Console {
 static Console con[2];
 static SemaphoreHandle_t mux;
 static uint32_t lastUartActivity = 0;
+// -1 means no UART is currently selected for the automatic OLED terminal view.
 static int8_t activeUartScreen = -1;
 static char terminalNames[2][25] = {"Pi #1", "Pi #2"};
 #define LOCK()   xSemaphoreTakeRecursive(mux, portMAX_DELAY)
@@ -173,16 +189,21 @@ static void loadTerminalNames() {
   if (prefs.getBytesLength("termNames") != sizeof(stored) ||
       prefs.getBytes("termNames", stored, sizeof(stored)) != sizeof(stored)) return;
   for (int i = 0; i < 2; ++i) {
-    if (!memchr(stored[i], '\0', sizeof(stored[i])) || stored[i][0] == '\0') return;
+    char* name = stored + i * sizeof(terminalNames[i]);
+    if (!memchr(name, '\0', sizeof(terminalNames[i])) || name[0] == '\0') return;
   }
   memcpy(terminalNames, stored, sizeof(terminalNames));
 }
 
+// Persist framing parameters per port. parity is encoded as 0=none, 1=even,
+// 2=odd so the settings blob remains compact and easy to validate on startup.
 struct UartSettings { uint32_t baud; uint8_t bits; uint8_t parity; uint8_t stop; };
 static const UartSettings DEFAULT_UART_SETTINGS = {UART_BAUD, 8, 0, 1};
 static UartSettings uartSettings[2] = {DEFAULT_UART_SETTINGS, DEFAULT_UART_SETTINGS};
 
 static bool validUartSettings(const UartSettings& s) {
+  // Keep the ranges aligned with the web form and protect the configuration
+  // lookup table in uartConfig() from out-of-range values read from NVS.
   return s.baud >= 300 && s.baud <= 2000000 && s.bits >= 5 && s.bits <= 8 &&
          s.parity <= 2 && (s.stop == 1 || s.stop == 2);
 }
@@ -195,6 +216,7 @@ static uint32_t uartConfig(const UartSettings& s) {
   };
   return configs[s.bits - 5][s.parity][s.stop - 1];
 }
+// Ignore malformed or outdated NVS blobs and retain compile-time defaults.
 static void loadUartSettings() {
   for (int i = 0; i < 2; ++i) {
     String key = String("uart") + i;
@@ -210,6 +232,7 @@ static void loadUartSettings() {
     }
   }
 }
+// Configure both physical UARTs from the validated settings loaded at boot.
 static void startUarts() {
   Serial0.setRxBufferSize(UART_RX_BUF);
   Serial0.begin(uartSettings[0].baud, uartConfig(uartSettings[0]), PIN_P1_RX, PIN_P1_TX);
@@ -217,11 +240,14 @@ static void startUarts() {
   Serial1.begin(uartSettings[1].baud, uartConfig(uartSettings[1]), PIN_P2_RX, PIN_P2_TX);
 }
 
+// Commit the current partial line into the circular history, then start a new
+// partial line. The caller has already checked the fixed-buffer capacity.
 static void commitLine(Console& c) {
   memcpy(c.lines[c.head], c.cur, c.clen); c.llen[c.head] = c.clen;
   c.head = (c.head + 1) % HIST_LINES; if (c.cnt < HIST_LINES) c.cnt++;
   c.clen = 0;
 }
+// Send staged raw bytes to all connected browsers that can accept a frame.
 static void flushOut(Console& c) {
   if (!c.olen) return;
   for (auto& s : c.cli) if (s.used) {
@@ -230,6 +256,9 @@ static void flushOut(Console& c) {
   }
   c.olen = 0; c.lastFlush = millis();
 }
+// Drain one physical UART without blocking the main loop for an unbounded time.
+// In parallel, retain raw bytes for HTTP polling, broadcast them over WebSocket,
+// build a printable line history for OLED, and mark this port as recently active.
 static void pump(Console& c, int idx) {
   if (!c.ser->available() && !c.olen) return;
   LOCK();
@@ -249,6 +278,7 @@ static void pump(Console& c, int idx) {
   if (c.olen && (millis() - c.lastFlush >= FLUSH_MS || c.olen >= OUT_MAX / 2)) flushOut(c);
   UNLOCK();
 }
+// Remove WebSocket clients whose session expired or was revoked.
 static void wsCheck() {   // закрывает сокеты с недействительной сессией
   LOCK();
   for (auto& c : con) for (auto& s : c.cli) if (s.used && findSessTok(s.tok) < 0) {
@@ -258,11 +288,15 @@ static void wsCheck() {   // закрывает сокеты с недейств
   }
   UNLOCK();
 }
+// Revoke all sessions for a user, except an optional session being used by the
+// current password-change request, then close any now-invalid terminal sockets.
 static void kickUser(int u, int except) {
   for (int i = 0; i < MAX_SESS; i++) if (sess[i].used && sess[i].user == u && i != except) sess[i].used = false;
   wsCheck();
 }
 
+// One handler is installed for each /ws/N endpoint. A browser's terminal bytes
+// are validated/reassembled by ws_uart before being written to that UART.
 static void onWs(int idx, AsyncWebSocketClient* cl, AwsEventType t, void* arg, uint8_t* data, size_t len) {
   Console& c = con[idx];
   if (t == WS_EVT_CONNECT) {
@@ -303,7 +337,8 @@ static void onWs(int idx, AsyncWebSocketClient* cl, AwsEventType t, void* arg, u
   }
 }
 
-// ===================================================================== relays
+// ===================================================================== relay outputs
+// Relay state is persisted immediately so it can be restored after an ESP32 reset.
 struct Relay { uint8_t pin; bool on; uint32_t cycleAt; };
 static Relay relays[2] = {{PIN_RELAY1, true, 0}, {PIN_RELAY2, true, 0}};
 static void relaySet(int i, bool on) {
@@ -315,6 +350,8 @@ static void relayInit() {
   for (int i = 0; i < 2; i++) {
     bool on = prefs.getBool(i ? "r1" : "r0", true);
     relays[i].on = on;
+    // Set the output latch before enabling output mode to minimize a software-
+    // controlled pulse while restoring the saved relay state.
     digitalWrite(relays[i].pin, (on == (bool)RELAY_ACTIVE_HIGH) ? HIGH : LOW);
     pinMode(relays[i].pin, OUTPUT);
   }
@@ -324,7 +361,9 @@ static void relayTick() {
     if (relays[i].cycleAt && (int32_t)(millis() - relays[i].cycleAt) >= 0) { relays[i].cycleAt = 0; relaySet(i, true); }
 }
 
-// ===================================================================== WireGuard config
+// ===================================================================== WireGuard profiles and state machine
+// The runtime form uses Arduino String/IP types; StoredVpnCfg is the validated,
+// fixed-size representation kept in NVS and defined in vpn_profiles.h.
 static const size_t VPN_TUNNEL_COUNT = vpn_profiles::COUNT;
 static const size_t VPN_MAX_ROUTES = 8;
 struct VpnCfg {
@@ -356,6 +395,7 @@ static bool b64key(const String& v) {
   return v.length() == 44 && v[43] == '=' &&
          mbedtls_base64_decode(d, sizeof d, &ol, (const uint8_t*)v.c_str(), v.length()) == 0 && ol == 32;
 }
+// Parse only IPv4 CIDRs. IPv6 and malformed prefixes are rejected explicitly.
 static bool parseCidr(String s, IPAddress& ip, int& bits) {
   s.trim();
   if (s.indexOf(':') >= 0) return false;
@@ -372,6 +412,9 @@ static bool parseCidr(String s, IPAddress& ip, int& bits) {
   }
   return ip.fromString(a);
 }
+// Parse the supported wg-quick subset: one Interface, one Peer, IPv4 routes,
+// keys, endpoint, and keepalive. Unused wg-quick keys are ignored; required
+// fields are checked after parsing so incomplete profiles never reach NVS.
 static bool parseWg(const String& txt, VpnCfg& o, String& err) {
   o = VpnCfg(); o.ka = 0; o.bits = 32;
   int sec = 0, peers = 0, pos = 0, ln = 0;
@@ -408,7 +451,7 @@ static bool parseWg(const String& txt, VpnCfg& o, String& err) {
         if (!got) { err = at + "Address пуст"; return false; }
         hAddr = true;
       }
-      // DNS, MTU, ListenPort, PostUp и т.п. игнорируются
+      // DNS, MTU, ListenPort, PostUp и т.п. не применяются этой прошивкой.
     } else {
       if (k == "publickey") { if (!b64key(v)) { err = at + "PublicKey некорректен (нужен base64, 32 байта)"; return false; } o.pub = v; hPub = true; }
       else if (k == "presharedkey") {
@@ -517,6 +560,8 @@ static bool persistVpnSet(const StoredVpnSet& candidate) {
   return prefs.putBytes("wg_profiles", &candidate, sizeof(candidate)) == sizeof(candidate) &&
          prefs.getBytesLength("wg_profiles") == sizeof(candidate);
 }
+// Replace a profile only after validation and conflict checks succeed. The
+// candidate set is persisted before runtime tunnel state is changed.
 static bool saveVpn(size_t index, const VpnCfg& cfg) {
   if (index >= VPN_TUNNEL_COUNT) return false;
   StoredVpnSet candidate = storedVpns;
@@ -540,6 +585,7 @@ static bool saveVpn(size_t index, const VpnCfg& cfg) {
   tunnel.stateAt = millis();
   return true;
 }
+// Remove exactly one tunnel and its routes; other profiles remain untouched.
 static bool deleteVpn(size_t index) {
   if (index >= VPN_TUNNEL_COUNT) return false;
   StoredVpnSet candidate = storedVpns;
@@ -554,6 +600,8 @@ static bool deleteVpn(size_t index) {
   tunnel.state = V_OFF;
   return true;
 }
+// Load the current multi-profile format or migrate the legacy single-profile
+// keys once, then put every valid configured tunnel in its initial state.
 static void loadVpn() {
   StoredVpnSet stored = {};
   if (prefs.getBytesLength("wg_profiles") == sizeof(stored) &&
@@ -627,6 +675,8 @@ static const char* vpnName(const VpnTunnel& tunnel) {
   return "?";
 }
 static void vpnTick() {
+  // Advance each tunnel independently; DNS, time synchronization, and handshake
+  // setup are spread across loop iterations instead of blocking setup().
   for (size_t i = 0; i < VPN_TUNNEL_COUNT; ++i) {
     VpnTunnel& tunnel = vpnTunnels[i];
     VpnCfg& cfg = tunnel.cfg;
@@ -695,7 +745,9 @@ static void vpnTick() {
   }
 }
 
-// ===================================================================== network
+// ===================================================================== Wi-Fi and mDNS
+// The station retries saved profiles round-robin. The setup AP is brought up
+// after a prolonged disconnect, and stopped again when station connectivity returns.
 static bool apOn = false, mdnsOn = false;
 static wifi_profiles::Profile wifiProfiles[wifi_profiles::MAX_PROFILES] = {};
 static size_t wifiProfileCount = 0, wifiCurrentProfile = 0;
@@ -704,6 +756,7 @@ static bool wifiAttemptStarted = false;
 
 static void mdnsRestart() { if (mdnsOn) MDNS.end(); mdnsOn = false; }
 
+// Persist only a validated profile set and verify the resulting NVS blob size.
 static bool persistWifiProfiles(const wifi_profiles::Store& store) {
   if (!wifi_profiles::valid(store)) return false;
   return prefs.putBytes("wifi_v1", &store, sizeof(store)) == sizeof(store) &&
@@ -720,6 +773,8 @@ static void loadWifiProfiles() {
     return;
   }
 
+  // Missing/corrupt profile storage falls back to the compile-time network so
+  // the device remains reachable for initial setup.
   if (prefs.isKey("wifi_v1")) Serial.println("[WiFi] Saved profiles invalid; restoring fallback");
   stored.version = wifi_profiles::STORE_VERSION;
   stored.count = 1;
@@ -781,20 +836,25 @@ static String vpnStatusText() {
   return String("up ") + connected + "/" + configured;
 }
 
-// ===================================================================== OLED
+// ===================================================================== OLED screens and idle game
 static String oledPrev;
+// Avoid rewriting an unchanged four-line screen over I2C.
 static void oledShow(const String& a, const String& b, const String& c, const String& d) {
   String all = a + "|" + b + "|" + c + "|" + d;
   if (all == oledPrev) return;
   oledPrev = all;
-  oled.clearBuffer(); oled.setFont(u8g2_font_5x7_tr);
-  oled.drawStr(0, 7, a.c_str()); oled.drawStr(0, 15, b.c_str()); oled.drawStr(0, 23, c.c_str()); oled.drawStr(0, 31, d.c_str());
+  oled.clearBuffer(); oled.setFont(u8g2_font_5x7_t_cyrillic);
+  oled.drawUTF8(0, 7, a.c_str()); oled.drawUTF8(0, 15, b.c_str());
+  oled.drawUTF8(0, 23, c.c_str()); oled.drawUTF8(0, 31, d.c_str());
   oled.sendBuffer();
 }
 static uint32_t oledT = 0;
+// screen 0 is status, 1/2 are terminal views, 3 is network/VPN diagnostics.
 static int screen = 0;
 static bool bootRelayMode = false;
 static uint8_t bootRelaySelection = 0;
+// Snake board is 32x8 logical cells, each rendered as a 4x4 pixel block.
+// The body is stored head-first as linear cell indices.
 static const uint8_t SNAKE_WIDTH = 32;
 static const uint8_t SNAKE_HEIGHT = 8;
 static const uint16_t SNAKE_CELLS = SNAKE_WIDTH * SNAKE_HEIGHT;
@@ -806,18 +866,31 @@ static uint32_t snakeStepAt = 0;
 static bool snakeStarted = false;
 
 static String cut(const String& s, size_t n) { return s.length() > n ? s.substring(0, n) : s; }
+static String cutUtf8(const String& s, size_t maxChars) {
+  size_t bytes = 0, chars = 0;
+  while (bytes < s.length() && chars < maxChars) {
+    const uint8_t c = s[bytes];
+    const size_t width = c < 0x80 ? 1 : (c < 0xe0 ? 2 : (c < 0xf0 ? 3 : 4));
+    if (bytes + width > s.length()) break;
+    bytes += width;
+    ++chars;
+  }
+  return bytes < s.length() ? s.substring(0, bytes) : s;
+}
 static void oledOverview(const String& a, const String& b, const String& c, const String& d) {
   String key = a + "|" + b + "|" + c + "|" + d;
   if (key == oledPrev) return;
   oledPrev = key;
   oled.clearBuffer();
-  oled.setFont(u8g2_font_5x7_tr);
-  oled.drawStr(0, 7, cut(a, 21).c_str());
-  oled.drawStr(0, 15, cut(b, 21).c_str());
-  oled.drawStr(0, 23, cut(c, 21).c_str());
-  oled.drawStr(0, 31, cut(d, 21).c_str());
+  oled.setFont(u8g2_font_5x7_t_cyrillic);
+  oled.drawUTF8(0, 7, cutUtf8(a, 21).c_str());
+  oled.drawUTF8(0, 15, cutUtf8(b, 21).c_str());
+  oled.drawUTF8(0, 23, cutUtf8(c, 21).c_str());
+  oled.drawUTF8(0, 31, cutUtf8(d, 21).c_str());
   oled.sendBuffer();
 }
+// Convert a logical cell plus cardinal direction into a neighboring board
+// cell. Hitting an edge is reported to the caller instead of wrapping around.
 static bool snakeNextCell(uint16_t cell, uint8_t direction, uint16_t& next) {
   const int x = cell % SNAKE_WIDTH;
   const int y = cell / SNAKE_WIDTH;
@@ -827,6 +900,7 @@ static bool snakeNextCell(uint16_t cell, uint8_t direction, uint16_t& next) {
   else { if (!x) return false; next = cell - 1; }
   return true;
 }
+// The tail is considered free only when this move will advance it (no growth).
 static bool snakeOccupied(uint16_t cell, bool tailMoves) {
   for (uint16_t i = 1; i < snakeLength; ++i) {
     if (tailMoves && i == snakeLength - 1) continue;
@@ -834,11 +908,13 @@ static bool snakeOccupied(uint16_t cell, bool tailMoves) {
   }
   return false;
 }
+// Place food only on a free cell. The full-board case is represented by -1.
 static void snakePlaceFood() {
   if (snakeLength >= SNAKE_CELLS) { snakeFood = -1; return; }
   do { snakeFood = esp_random() % SNAKE_CELLS; }
   while (snakeOccupied(snakeFood, false) || snakeBody[0] == snakeFood);
 }
+// Start a fresh run in the middle of the display with the snake facing right.
 static void snakeReset() {
   snakeLength = 4;
   snakeDirection = 1;
@@ -848,6 +924,8 @@ static void snakeReset() {
   snakeStarted = true;
   snakeStepAt = millis();
 }
+// Breadth-first search finds the shortest route to food while treating the
+// current body as blocked (apart from the tail, which moves on a normal step).
 static bool snakeFindFoodDirection(uint8_t& direction) {
   static uint16_t queue[SNAKE_CELLS];
   static int16_t distance[SNAKE_CELLS];
@@ -870,6 +948,8 @@ static bool snakeFindFoodDirection(uint8_t& direction) {
   }
   return false;
 }
+// If food is unreachable, estimate free space for each legal next move and
+// choose the move that leaves the largest connected area.
 static uint16_t snakeReachableSpace(uint16_t start, uint16_t oldHead, bool tailMoves) {
   static uint16_t queue[SNAKE_CELLS];
   static bool seen[SNAKE_CELLS];
@@ -889,6 +969,7 @@ static uint16_t snakeReachableSpace(uint16_t start, uint16_t oldHead, bool tailM
   }
   return write;
 }
+// Prefer the shortest food path; if none exists, prefer the safest open area.
 static bool snakeChooseDirection(uint8_t& direction) {
   if (snakeFood >= 0 && snakeFindFoodDirection(direction)) return true;
   const uint16_t head = snakeBody[0];
@@ -909,6 +990,8 @@ static bool snakeChooseDirection(uint8_t& direction) {
   }
   return found;
 }
+// Advance game state at a fixed cadence. Collision/no legal move starts a new
+// run; eating extends the body by retaining the previous tail position.
 static void snakeTick() {
   if (!snakeStarted) snakeReset();
   if (snakeLength >= SNAKE_CELLS) return;
@@ -926,6 +1009,8 @@ static void snakeTick() {
   snakeDirection = direction;
   if (eating) snakePlaceFood();
 }
+// Draw a blinking food pixel and the current body; game updates remain separate
+// from rendering so the OLED loop can keep its own refresh cadence.
 static void oledSnake() {
   snakeTick();
   const uint32_t frame = millis() / 300;
@@ -971,10 +1056,12 @@ static void consoleLines(int idx, String out[4]) {   // последние 4 с�
     tmp[k++] = cleanLine(c.lines[j], c.llen[j]);
   }
   UNLOCK();
-  out[0] = cut(String(terminalNames[idx]), 25);
+  out[0] = String(terminalNames[idx]);
   for (int i = 0; i < 3; i++) out[3 - i] = i < k ? cut(tmp[i], 25) : String();
   if (k == 0) out[3] = "No data";
 }
+// OLED priority: relay-selection prompt, recent UART activity, idle game,
+// manually selected terminal, then status/network diagnostics.
 static void oledTick() {
   if (bootRelayMode) {
     if (millis() - oledT < 100) return;
@@ -1009,7 +1096,9 @@ static void oledTick() {
 }
 
 
-// ===================================================================== buttons
+// ===================================================================== BOOT button
+// A debounced press is classified once as short or long; the release after a
+// long press does not accidentally trigger a second short-press action.
 struct Btn { uint8_t pin; bool down; bool longDone; uint32_t t; };
 static Btn btns[1] = {{PIN_BTN_BOOT, false, false, 0}};
 static void btnInit() { pinMode(btns[0].pin, INPUT_PULLUP); }
@@ -1052,6 +1141,7 @@ static void btnTick() {
 }
 
 // ===================================================================== HTTP API
+// statusJson is intentionally read-only and omits credentials and key material.
 static String statusJson() {
   bool sta = WiFi.status() == WL_CONNECTED;
   String j = "{\"ip\":\"" + curIp() + "\",\"mode\":\"" + (sta ? "STA" : (apOn ? "AP" : "-")) + "\",\"rssi\":" + String(sta ? WiFi.RSSI() : 0) +
@@ -1076,6 +1166,8 @@ static bool vpnIndex(AsyncWebServerRequest* r, bool post, size_t& idx) {
   return true;
 }
 static bool parseSequence(const String& value, uint64_t& sequence) {
+  // Decimal-only parser with overflow detection for monotonically increasing
+  // UART ring-buffer positions supplied by the browser.
   if (!value.length()) return false;
   sequence = 0;
   for (size_t i = 0; i < value.length(); ++i) {
@@ -1086,6 +1178,8 @@ static bool parseSequence(const String& value, uint64_t& sequence) {
   }
   return true;
 }
+// HTML is embedded in PROGMEM; use the flash-aware length when constructing
+// the response rather than treating the program-memory pointer as RAM data.
 static void sendPage(AsyncWebServerRequest* r, const char* html) {
   AsyncWebServerResponse* res = r->beginResponse(200, "text/html; charset=utf-8", (const uint8_t*)html, strlen_P(html));
   res->addHeader("Cache-Control", "no-store");
@@ -1093,6 +1187,8 @@ static void sendPage(AsyncWebServerRequest* r, const char* html) {
 }
 
 static void setupHttp() {
+  // Static terminal assets are served from LittleFS; HTML application/login
+  // pages are compiled into web_ui.h and selected according to the session.
   server.serveStatic("/assets/", LittleFS, "/assets/", "public,max-age=31536000,immutable");
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* r) {
@@ -1105,6 +1201,8 @@ static void setupHttp() {
     sendPage(r, si >= 0 ? APP_HTML : LOGIN_HTML);
   });
 
+  // Login issues a random in-RAM session token and applies a bounded per-IP
+  // lockout. A new admin account is marked must-change until /api/passwd succeeds.
   server.on("/api/login", HTTP_POST, [](AsyncWebServerRequest* r) {
     Fail* f = failFor((uint32_t)r->client()->remoteIP());
     if ((int32_t)(f->until - millis()) > 0 && f->n >= LOCK_FAILS) {
@@ -1138,6 +1236,8 @@ static void setupHttp() {
     sendJson(r, 200, String("{\"user\":\"") + u.name + "\",\"role\":\"" + ROLE_NAME[u.role] + "\",\"must\":" + (u.must ? "true" : "false") + "}");
   });
   server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest* r) { if (auth(r, R_RO) < 0) return; sendJson(r, 200, statusJson()); });
+  // Terminal names are readable by authenticated clients for labels/status,
+  // but only an administrator may persist replacements.
   server.on("/api/terminals", HTTP_GET, [](AsyncWebServerRequest* r) {
     if (auth(r, R_RO) < 0) return;
     sendJson(r, 200, String("{\"names\":[\"") + jesc(String(terminalNames[0])) + "\",\"" +
@@ -1170,6 +1270,8 @@ static void setupHttp() {
     sendJson(r, 200, String("{\"ok\":true,\"names\":[\"") + jesc(String(terminalNames[0])) + "\",\"" +
              jesc(String(terminalNames[1])) + "\"]}");
   });
+  // Reading is sequence-based: clients ask for bytes after `since`; the RX
+  // buffer clamps requests that have fallen behind its oldest retained byte.
   server.on("/api/uart/read", HTTP_GET, [](AsyncWebServerRequest* r) {
     if (auth(r, R_RO) < 0) return;
     int idx;
@@ -1195,6 +1297,8 @@ static void setupHttp() {
     snprintf(seq, sizeof(seq), "%llu", static_cast<unsigned long long>(next));
     sendJson(r, 200, String("{\"seq\":\"") + seq + "\",\"data\":\"" + data + "\"}");
   });
+  // Writes are bounded per HTTP request. The browser batches terminal input
+  // below this limit and sends binary-safe URL-encoded payloads.
   server.on("/api/uart/send", HTTP_POST, [](AsyncWebServerRequest* r) {
     int si = auth(r, R_RW); if (si < 0) return;
     int idx;
@@ -1209,7 +1313,9 @@ static void setupHttp() {
     sendJson(r, 200, String("{\"ok\":true,\"bytes\":") + String((unsigned)written) + "}");
   });
   // Register the base URI after /read and /send: AsyncWebServer matches
-  // a base path as a prefix for nested paths.
+  // a base path as a prefix for nested paths, so ordering is significant.
+  // Base UART settings routes are deliberately registered after the nested
+  // read/send routes because this web server matches base paths as prefixes.
   server.on("/api/uart", HTTP_GET, [](AsyncWebServerRequest* r) {
     if (auth(r, R_ADMIN) < 0) return;
     String j = "[";
@@ -1253,6 +1359,8 @@ static void setupHttp() {
     sendJson(r, 200, "{\"ok\":true,\"restart\":true}");
   });
 
+  // Password changes require the old password, rotate the salt, and revoke
+  // other sessions for the affected user.
   server.on("/api/passwd", HTTP_POST, [](AsyncWebServerRequest* r) {
     int si = auth(r, R_RO, true); if (si < 0) return;
     User& u = users[sess[si].user];
@@ -1265,6 +1373,7 @@ static void setupHttp() {
     sendJson(r, 200, "{\"ok\":true}");
   });
 
+  // Administrative routes never include password hashes or salts in responses.
   server.on("/api/users", HTTP_GET, [](AsyncWebServerRequest* r) {
     if (auth(r, R_ADMIN) < 0) return;
     String j = "["; bool f = true;
@@ -1281,6 +1390,8 @@ static void setupHttp() {
     }
     sendJson(r, 200, j + "]");
   });
+  // An empty password inherits the previous password only for an unchanged
+  // SSID. Open networks must be explicitly selected in the form.
   server.on("/api/wifi/profiles", HTTP_POST, [](AsyncWebServerRequest* r) {
     int si = auth(r, R_ADMIN); if (si < 0) return;
     wifi_profiles::Store store = {};
@@ -1359,6 +1470,8 @@ static void setupHttp() {
     sendJson(r, 200, "{\"ok\":true}");
   });
 
+  // Web and BOOT relay actions share relaySet(), so hardware, NVS, and status
+  // output remain synchronized regardless of the control surface.
   server.on("/api/relay", HTTP_POST, [](AsyncWebServerRequest* r) {
     int si = auth(r, R_RW); if (si < 0) return;
     int i = P(r, "idx").toInt(); String a = P(r, "act");
@@ -1391,6 +1504,8 @@ static void setupHttp() {
     }
     sendJson(r, 200, j + "]}");
   });
+  // VPN configuration arrives as a bounded raw request body rather than form
+  // fields. The body callback checks authorization and caps uploads at 4 KiB.
   server.on("/api/vpn", HTTP_POST,
     [](AsyncWebServerRequest* r) {
       if (auth(r, R_ADMIN) < 0) return;
@@ -1421,7 +1536,8 @@ static void setupHttp() {
     sendJson(r, 200, String("{\"ok\":true,\"idx\":") + index + "}");
   });
 
-  // WebSocket: без валидной сессии апгрейд не выполняется (404)
+  // Reject unauthenticated/first-login WebSocket upgrades before the UART
+  // event handler. The two endpoints retain separate per-port client lists.
   auto flt = [](AsyncWebServerRequest* r) { int si = findSession(r); return si >= 0 && !users[sess[si].user].must; };
   ws0.setFilter(flt); ws1.setFilter(flt);
   ws0.onEvent([](AsyncWebSocket*, AsyncWebSocketClient* c, AwsEventType t, void* a, uint8_t* d, size_t l) { onWs(0, c, t, a, d, l); });
@@ -1431,8 +1547,10 @@ static void setupHttp() {
   server.begin();
 }
 
-// ===================================================================== setup / loop
+// ===================================================================== device startup and cooperative main loop
 void setup() {
+  // Restore relay outputs before slower initialization, then load persistent
+  // settings and initialize the display/UARTs before bringing up Wi-Fi.
   Serial.begin(115200);
   mux = xSemaphoreCreateRecursiveMutex();
   prefs.begin("gw", false);
@@ -1473,6 +1591,8 @@ void setup() {
 }
 
 void loop() {
+  // Keep each subsystem non-blocking: service serial traffic first, then
+  // advance network/VPN/relay/button/display state machines on every pass.
   pump(con[0], 0); pump(con[1], 1);
   netTick(); vpnTick(); relayTick(); btnTick(); oledTick();
   static uint32_t chk = 0;
