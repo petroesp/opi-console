@@ -658,13 +658,18 @@
       {
         "filename": "opi-console.kicad_sch",
         "name": "opi-console",
-        "uuid": "00000000-0000-0000-0000-000000000000"
+        "uuid": "7507d638-1622-4611-9c32-ab6776307f22"
       }
     ],
-    "used_designators": "U1-2",
+    "used_designators": "SW1,#PWR1-3,J1-3,C1,R1,U1-2",
     "variants": []
   },
-  "sheets": [],
+  "sheets": [
+    [
+      "7507d638-1622-4611-9c32-ab6776307f22",
+      "opi-console"
+    ]
+  ],
   "text_variables": {},
   "tuning_profiles": {
     "meta": {

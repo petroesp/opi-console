@@ -48,6 +48,9 @@ main{flex:1;min-height:0;display:flex;flex-direction:column;padding:8px;gap:8px}
 .admin-card input,.admin-card select{max-width:100%}.profile-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:10px}
 .profile-row{border:1px solid var(--br);border-radius:8px;padding:10px;display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .profile-row label{font-size:12px;color:var(--mut)}.profile-row input[type=text],.profile-row input[type=password]{width:100%;margin-top:4px}
+.measurement-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
+.measurement{border:1px solid var(--br);border-radius:8px;padding:10px;color:var(--mut)}
+.measurement strong{display:block;color:var(--fg);font-size:20px;margin-top:3px}
 .profile-row .open{grid-column:1/-1;color:var(--mut);font-size:12px}.admin-table{overflow:auto}
 .admin-table table{min-width:500px}.admin-table td{padding:5px;border-bottom:1px solid var(--br)}
 .admin-card .msg{margin-top:8px}.msg.good{color:var(--ok)}
@@ -84,7 +87,7 @@ textarea{width:100%;height:150px;font-family:monospace}table{width:100%;border-c
 <script src="/assets/xterm.js"></script>
 <script src="/assets/addon-fit.js"></script>
 <script>
-const $=s=>document.querySelector(s);let me=null,cur=0,view='t',online=[false,false],rxSeq=[null,null],pollBusy=[false,false],rel=[1,1],terminalNames=['Pi #1','Pi #2'];
+const $=s=>document.querySelector(s);let me=null,cur=0,view='t',online=[false,false],rxSeq=[null,null],pollBusy=[false,false],rel=[1,1],terminalNames=['Pi #1','Pi #2'],voltageTimer=null;
 const T=[null,null],txPending=['',''],txBusy=[false,false];
 async function api(u,d){let r;try{r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(d||{})})}
 catch(e){return{ok:false,j:{error:'Сетевая ошибка: '+e.message}}}
@@ -147,6 +150,7 @@ for(const [id,a] of [['r_on','on'],['r_off','off'],['r_cy','cycle']])$('#'+id).o
 if(a!='on'&&!confirm('Изменить питание '+terminalNames[cur]+'?'))return;await api('/api/relay',{idx:cur,act:a});stat()};
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 async function admin(){
+if(voltageTimer){clearInterval(voltageTimer);voltageTimer=null}
 const a=$('#adm');a.innerHTML='<div class="admin-page"><p>Загрузка настроек…</p></div>';
 try{
 const responses=await Promise.all(['/api/users','/api/vpn','/api/wifi/profiles','/api/uart','/api/terminals'].map(u=>fetch(u)));
@@ -154,6 +158,11 @@ if(responses.some(r=>!r.ok))throw new Error('Не удалось загрузи�
 const [us,v,wifi,uart,terminals]=await Promise.all(responses.map(r=>r.json()));
 applyTerminalNames(terminals.names);
 let h='<div class="admin-page"><h1 style="font-size:21px;margin:4px 0 12px">Управление устройством</h1>';
+h+='<section class="admin-card"><h2>Напряжение и ток</h2><p>Текущие измерения ADC, обновляются каждую секунду.</p><div class="measurement-grid">'+
+'<div class="measurement">Напряжение 1<strong id="voltage-v1">—</strong></div>'+
+'<div class="measurement">Напряжение 2<strong id="voltage-v2">—</strong></div>'+
+'<div class="measurement">Ток<strong id="voltage-current">—</strong></div>'+
+'</div><div class="hint" id="voltage-status" role="status">Загрузка измерений…</div></section>';
 h+='<section class="admin-card"><h2>Пользователи</h2><p>Роли и пароли учётных записей веб-консоли.</p><div class="admin-table"><table>';
 for(const u of us)h+=`<tr data-n="${esc(u.name)}"><td>${esc(u.name)}</td><td><select>${['ro','rw','admin'].map(r=>`<option${r==u.role?' selected':''}>${r}</option>`).join('')}</select></td>
 <td><input placeholder="Новый пароль" type="password" autocomplete="new-password" style="width:150px"></td><td><button class="sv">Сохранить</button> <button class="d dl">Удалить</button></td></tr>`;
@@ -192,6 +201,21 @@ h+=`<div class="admin-card" style="margin-top:10px"><h3 style="margin:0 0 8px">�
 <div class="msg wg-msg" data-idx="${i}" role="status"></div></div>`}
 h+='</section></div>';
 a.innerHTML=h;
+const refreshVoltage=async()=>{
+try{
+const response=await fetch('/api/voltage',{cache:'no-store'});
+if(!response.ok)throw new Error('HTTP '+response.status);
+const data=await response.json();
+const v1=data.channels[0],v2=data.channels[1],current=data.shunt;
+$('#voltage-v1').textContent=v1.valid?Number(v1.voltage).toFixed(3)+' В':'—';
+$('#voltage-v2').textContent=v2.valid?Number(v2.voltage).toFixed(3)+' В':'—';
+$('#voltage-current').textContent=current.valid?Number(current.current_amps).toFixed(3)+' А':'—';
+$('#voltage-status').textContent=[v1.valid,v2.valid,current.valid].every(Boolean)
+?'Усреднение: 64 отсчёта на канал.'
+:'Ожидание первых 64 отсчётов измерения.';
+}catch(e){$('#voltage-status').textContent='Ошибка чтения измерений: '+e.message}
+};
+refreshVoltage();voltageTimer=setInterval(()=>{if(view=='a')refreshVoltage()},1000);
 a.querySelectorAll('tr[data-n]').forEach(tr=>{const n=tr.dataset.n;
 tr.querySelector('.sv').onclick=async()=>{const r=await api('/api/users/set',{name:n,role:tr.querySelector('select').value,pass:tr.querySelector('input').value});$('#um').textContent=r.ok?'Сохранено':(r.j.error||'Ошибка сохранения');$('#um').className='msg'+(r.ok?' good':'');if(r.ok)admin()};
 tr.querySelector('.dl').onclick=async()=>{if(!confirm('Удалить пользователя '+n+'?'))return;const r=await api('/api/users/del',{name:n});if(r.ok)admin();else $('#um').textContent=r.j.error||'Ошибка удаления'}});

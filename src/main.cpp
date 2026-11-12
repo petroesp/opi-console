@@ -279,6 +279,14 @@ static void voltageTick() {
   }
   UNLOCK();
 }
+static float inputVoltage(uint16_t adcMilliVolts) {
+  return adcMilliVolts *
+         (float)(VOLTAGE_DIVIDER_TOP_OHMS + VOLTAGE_DIVIDER_BOTTOM_OHMS) /
+         VOLTAGE_DIVIDER_BOTTOM_OHMS / 1000.0f;
+}
+static float shuntCurrent(uint16_t adcMilliVolts) {
+  return adcMilliVolts / 1000.0f / CURRENT_SHUNT_OHMS;
+}
 
 // Commit the current partial line into the circular history, then start a new
 // partial line. The caller has already checked the fixed-buffer capacity.
@@ -889,7 +897,7 @@ static void oledShow(const String& a, const String& b, const String& c, const St
   oled.sendBuffer();
 }
 static uint32_t oledT = 0;
-// screen 0 is status, 1/2 are terminal views, 3 is network/VPN diagnostics.
+// screen 0 is status, 1/2 are terminal views, 3 is network/VPN, 4 is telemetry.
 static int screen = 0;
 static bool bootRelayMode = false;
 static uint8_t bootRelaySelection = 0;
@@ -1101,7 +1109,7 @@ static void consoleLines(int idx, String out[4]) {   // последние 4 с�
   if (k == 0) out[3] = "No data";
 }
 // OLED priority: relay-selection prompt, recent UART activity, idle game,
-// manually selected terminal, then status/network diagnostics.
+// manually selected terminal, telemetry, then status/network diagnostics.
 static void oledTick() {
   if (bootRelayMode) {
     if (millis() - oledT < 100) return;
@@ -1125,6 +1133,17 @@ static void oledTick() {
     oledShow(cut(WiFi.status() == WL_CONNECTED ? WiFi.SSID() : String(AP_SSID), 25), String(HOSTNAME) + ".local",
              firstConfigured ? cut(firstConfigured->host + ":" + firstConfigured->port, 25) : String("VPN: none"),
              "up " + String(s / 3600) + "h" + String((s / 60) % 60) + "m heap " + String(ESP.getFreeHeap() / 1024) + "k");
+    return;
+  }
+  if (screen == 4) {
+    VoltageChannel snapshot[3];
+    LOCK();
+    memcpy(snapshot, voltageChannels, sizeof(snapshot));
+    UNLOCK();
+    oledShow("Voltage / current",
+             snapshot[0].ready ? String("V1: ") + String(inputVoltage(snapshot[0].averageMilliVolts), 2) + " V" : "V1: waiting...",
+             snapshot[1].ready ? String("V2: ") + String(inputVoltage(snapshot[1].averageMilliVolts), 2) + " V" : "V2: waiting...",
+             snapshot[2].ready ? String("I: ") + String(shuntCurrent(snapshot[2].averageMilliVolts), 3) + " A" : "I: waiting...");
     return;
   }
   String l2 = WiFi.status() == WL_CONNECTED ? String("STA ") + WiFi.RSSI() + "dBm"
@@ -1207,11 +1226,8 @@ static String voltageJson() {
          String(channel.ready ? VOLTAGE_SAMPLE_COUNT : channel.samples) +
          ",\"adc_millivolts\":";
     if (channel.ready) {
-      const float inputVoltage =
-          channel.averageMilliVolts *
-          (float)(VOLTAGE_DIVIDER_TOP_OHMS + VOLTAGE_DIVIDER_BOTTOM_OHMS) /
-          VOLTAGE_DIVIDER_BOTTOM_OHMS / 1000.0f;
-      j += String(channel.averageMilliVolts) + ",\"voltage\":" + String(inputVoltage, 3);
+      j += String(channel.averageMilliVolts) + ",\"voltage\":" +
+           String(inputVoltage(channel.averageMilliVolts), 3);
     } else {
       j += "null,\"voltage\":null";
     }
@@ -1223,10 +1239,8 @@ static String voltageJson() {
        String(snapshot[2].ready ? VOLTAGE_SAMPLE_COUNT : snapshot[2].samples) +
        ",\"voltage_millivolts\":";
   if (snapshot[2].ready) {
-    const float currentAmps =
-        snapshot[2].averageMilliVolts / 1000.0f / CURRENT_SHUNT_OHMS;
     j += String(snapshot[2].averageMilliVolts) + ",\"current_amps\":" +
-         String(currentAmps, 3);
+         String(shuntCurrent(snapshot[2].averageMilliVolts), 3);
   } else {
     j += "null,\"current_amps\":null";
   }
