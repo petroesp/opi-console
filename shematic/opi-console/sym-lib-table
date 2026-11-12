@@ -1,0 +1,4 @@
+(sym_lib_table
+	(version 7)
+	(lib (name "ESP32C3-SUPERMINI") (type "KiCad") (uri "/home/sun/Документы/мои проэкты/esp 32 ttl reader/opi-console/shematic/ESP32C3-SUPERMINI.kicad_sym") (options "") (descr ""))
+)

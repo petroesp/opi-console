@@ -201,6 +201,15 @@ struct UartSettings { uint32_t baud; uint8_t bits; uint8_t parity; uint8_t stop;
 static const UartSettings DEFAULT_UART_SETTINGS = {UART_BAUD, 8, 0, 1};
 static UartSettings uartSettings[2] = {DEFAULT_UART_SETTINGS, DEFAULT_UART_SETTINGS};
 
+struct VoltageChannel {
+  uint32_t sumMilliVolts;
+  uint16_t averageMilliVolts;
+  uint8_t samples;
+  bool ready;
+};
+static VoltageChannel voltageChannels[3] = {};
+static uint32_t voltageLastSampleAt = 0;
+
 static bool validUartSettings(const UartSettings& s) {
   // Keep the ranges aligned with the web form and protect the configuration
   // lookup table in uartConfig() from out-of-range values read from NVS.
@@ -238,6 +247,37 @@ static void startUarts() {
   Serial0.begin(uartSettings[0].baud, uartConfig(uartSettings[0]), PIN_P1_RX, PIN_P1_TX);
   Serial1.setRxBufferSize(UART_RX_BUF);
   Serial1.begin(uartSettings[1].baud, uartConfig(uartSettings[1]), PIN_P2_RX, PIN_P2_TX);
+}
+
+static void voltageInit() {
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_VOLTAGE1_ADC, ADC_11db);
+  analogSetPinAttenuation(PIN_VOLTAGE2_ADC, ADC_11db);
+  analogSetPinAttenuation(PIN_CURRENT_ADC, ADC_0db);
+}
+
+static void voltageTick() {
+  const uint32_t now = millis();
+  if ((uint32_t)(now - voltageLastSampleAt) < VOLTAGE_SAMPLE_INTERVAL_MS) return;
+  voltageLastSampleAt = now;
+
+  const uint8_t pins[] = {PIN_VOLTAGE1_ADC, PIN_VOLTAGE2_ADC, PIN_CURRENT_ADC};
+  uint16_t readings[3];
+  for (uint8_t i = 0; i < 3; ++i) readings[i] = analogReadMilliVolts(pins[i]);
+
+  LOCK();
+  for (uint8_t i = 0; i < 3; ++i) {
+    VoltageChannel& channel = voltageChannels[i];
+    channel.sumMilliVolts += readings[i];
+    if (++channel.samples == VOLTAGE_SAMPLE_COUNT) {
+      channel.averageMilliVolts =
+          (channel.sumMilliVolts + VOLTAGE_SAMPLE_COUNT / 2) / VOLTAGE_SAMPLE_COUNT;
+      channel.sumMilliVolts = 0;
+      channel.samples = 0;
+      channel.ready = true;
+    }
+  }
+  UNLOCK();
 }
 
 // Commit the current partial line into the circular history, then start a new
@@ -1151,6 +1191,47 @@ static String statusJson() {
              jesc(String(terminalNames[1])) + "\"]}";
   return j;
 }
+static String voltageJson() {
+  VoltageChannel snapshot[3];
+  LOCK();
+  memcpy(snapshot, voltageChannels, sizeof(snapshot));
+  UNLOCK();
+
+  String j = "{\"channels\":[";
+  const uint8_t pins[] = {PIN_VOLTAGE1_ADC, PIN_VOLTAGE2_ADC};
+  for (uint8_t i = 0; i < 2; ++i) {
+    if (i) j += ",";
+    const VoltageChannel& channel = snapshot[i];
+    j += "{\"gpio\":" + String(pins[i]) + ",\"valid\":" +
+         (channel.ready ? "true" : "false") + ",\"samples\":" +
+         String(channel.ready ? VOLTAGE_SAMPLE_COUNT : channel.samples) +
+         ",\"adc_millivolts\":";
+    if (channel.ready) {
+      const float inputVoltage =
+          channel.averageMilliVolts *
+          (float)(VOLTAGE_DIVIDER_TOP_OHMS + VOLTAGE_DIVIDER_BOTTOM_OHMS) /
+          VOLTAGE_DIVIDER_BOTTOM_OHMS / 1000.0f;
+      j += String(channel.averageMilliVolts) + ",\"voltage\":" + String(inputVoltage, 3);
+    } else {
+      j += "null,\"voltage\":null";
+    }
+    j += "}";
+  }
+  j += "],\"shunt\":{\"gpio\":" + String(PIN_CURRENT_ADC) +
+       ",\"valid\":" + (snapshot[2].ready ? "true" : "false") +
+       ",\"samples\":" +
+       String(snapshot[2].ready ? VOLTAGE_SAMPLE_COUNT : snapshot[2].samples) +
+       ",\"voltage_millivolts\":";
+  if (snapshot[2].ready) {
+    const float currentAmps =
+        snapshot[2].averageMilliVolts / 1000.0f / CURRENT_SHUNT_OHMS;
+    j += String(snapshot[2].averageMilliVolts) + ",\"current_amps\":" +
+         String(currentAmps, 3);
+  } else {
+    j += "null,\"current_amps\":null";
+  }
+  return j + "}}";
+}
 static bool consoleIndex(AsyncWebServerRequest* r, bool post, int& idx) {
   const AsyncWebParameter* p = r->getParam("idx", post);
   if (!p) return false;
@@ -1236,6 +1317,10 @@ static void setupHttp() {
     sendJson(r, 200, String("{\"user\":\"") + u.name + "\",\"role\":\"" + ROLE_NAME[u.role] + "\",\"must\":" + (u.must ? "true" : "false") + "}");
   });
   server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest* r) { if (auth(r, R_RO) < 0) return; sendJson(r, 200, statusJson()); });
+  server.on("/api/voltage", HTTP_GET, [](AsyncWebServerRequest* r) {
+    if (auth(r, R_RO) < 0) return;
+    sendJson(r, 200, voltageJson());
+  });
   // Terminal names are readable by authenticated clients for labels/status,
   // but only an administrator may persist replacements.
   server.on("/api/terminals", HTTP_GET, [](AsyncWebServerRequest* r) {
@@ -1567,6 +1652,7 @@ void setup() {
   oled.begin(); oled.setContrast(100);
   oledShow("OPi Console", "boot...", "", "");
 
+  voltageInit();
   startUarts();
   con[0].ser = &Serial0; con[0].ws = &ws0;
   con[1].ser = &Serial1; con[1].ws = &ws1;
@@ -1594,7 +1680,7 @@ void loop() {
   // Keep each subsystem non-blocking: service serial traffic first, then
   // advance network/VPN/relay/button/display state machines on every pass.
   pump(con[0], 0); pump(con[1], 1);
-  netTick(); vpnTick(); relayTick(); btnTick(); oledTick();
+  netTick(); vpnTick(); relayTick(); btnTick(); oledTick(); voltageTick();
   static uint32_t chk = 0;
   if (millis() - chk > 2000) { chk = millis(); wsCheck(); ws0.cleanupClients(); ws1.cleanupClients(); }
   if (restartAt && (int32_t)(millis() - restartAt) >= 0) ESP.restart();

@@ -11,11 +11,21 @@
 
 // ---- UART к Orange Pi (3.3 В, параметры настраиваются в админке) ----
 #define UART_BAUD        115200
-#define PIN_P1_RX        0    // RX ESP32 <- TX Pi#1
-#define PIN_P1_TX        1    // TX ESP32 -> RX Pi#1
+#define PIN_P1_RX        20   // RX ESP32 <- TX Pi#1
+#define PIN_P1_TX        21   // TX ESP32 -> RX Pi#1
 #define PIN_P2_RX        3
 #define PIN_P2_TX        4
 #define UART_RX_BUF      4096
+
+// ---- Измерение напряжения и тока ----
+#define PIN_VOLTAGE1_ADC 0
+#define PIN_VOLTAGE2_ADC 1
+#define PIN_CURRENT_ADC  2
+#define VOLTAGE_DIVIDER_TOP_OHMS    56000UL
+#define VOLTAGE_DIVIDER_BOTTOM_OHMS 10000UL
+#define CURRENT_SHUNT_OHMS          0.05f // сопротивление шунта для измерения тока
+#define VOLTAGE_SAMPLE_COUNT        4 // усреднение по 4 отсчетам
+#define VOLTAGE_SAMPLE_INTERVAL_MS  10 // 10 мс между отсчетами
 
 // ---- OLED 0.91" SSD1306 128x32, I2C (адрес 0x3C) ----
 #define PIN_OLED_SDA     5
@@ -45,4 +55,4 @@
 #define PIN_BTN_BOOT     9
 #define BTN_LONG_MS      1500
 #define BTN_DEBOUNCE_MS  40
-#define SCREENS          4
+#define SCREENS          5
